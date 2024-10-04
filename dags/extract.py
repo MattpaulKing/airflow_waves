@@ -1,12 +1,14 @@
-import datetime
+import json
+import pandas as pd
 from typing import TypedDict
 import arrow
 import requests as r
 from dotenv import load_dotenv
 import os
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
 
-Coords = TypedDict("Coords", {"lat": float, "lng": float })
-
+Coords = TypedDict("Coords", {"beach": str, "lat": float, "lng": float })
 
 def waves_etl():
     """
@@ -14,7 +16,7 @@ def waves_etl():
         TODO: DOCS
 
     """
-    def extract(coords: Coords):
+    def extract(coords: Coords, api_key: str):
         """
         Fetches data from Storglass.io 
 
@@ -26,43 +28,46 @@ def waves_etl():
             }
         }]
         """
-        load_dotenv()
         start = arrow.now().floor('day')
         end = arrow.now().ceil('day')
 
-        response = r.get(
-            'https://api.stormglass.io/v2/weather/point',
-            params={
-                'lat': coords["lat"],
-                'lng': coords["lng"],
-                'params': ','.join([
-                    'waveHeight',
-                    'airTemperature',
-                    'swellDirection',
-                    'swellHeight',
-                    'swellPeriod',
-                    'secondarySwellDirection',
-                    'secondarySwellHeight',
-                    'secondarySwellPeriod',
-                    'waveDirection',
-                    'waveHeight',
-                    'wavePeriod',
-                    'windWaveDirection',
-                    'windWaveHeight',
-                    'windWavePeriod',
-                    'windDirection',
-                    'windSpeed'
-                ]),
-                'start': start.to('UTC').timestamp(),  # Convert to UTC timestamp
-                'end': end.to('UTC').timestamp()  # Convert to UTC timestamp
-            },
-            headers={
-                'Authorization': os.environ.get("STORMGLASS_API_KEY")
-            }
-        )
-        res = response.json()
-        print(res)
-        return res['hours']
+        responses = []
+        for i in range(5):
+            response = r.get(
+                'https://api.stormglass.io/v2/weather/point',
+                params={
+                    'lat': coords["lat"],
+                    'lng': coords["lng"],
+                    'params': ','.join([
+                        'waveHeight',
+                        'airTemperature',
+                        'swellDirection',
+                        'swellHeight',
+                        'swellPeriod',
+                        'secondarySwellDirection',
+                        'secondarySwellHeight',
+                        'secondarySwellPeriod',
+                        'waveDirection',
+                        'waveHeight',
+                        'wavePeriod',
+                        'windWaveDirection',
+                        'windWaveHeight',
+                        'windWavePeriod',
+                        'windDirection',
+                        'windSpeed'
+                    ]),
+                    'start': start.shift(days=i).to('UTC').timestamp(),  # Convert to UTC timestamp
+                    'end': end.shift(days=i).to('UTC').timestamp()  # Convert to UTC timestamp
+                },
+                headers={
+                    'Authorization': api_key
+                }
+            )
+            waves_data = response.json()
+            waves_data['beach'] = coords['beach']
+            responses.append(waves_data)
+           
+        return responses
 
     def transform(waves_data: list):
         """
@@ -70,10 +75,13 @@ def waves_etl():
         TODO: Must get average for every value
 
         """
-        for beach in waves_data:
-            for hour_record in beach:
+        hour_records = []
+        for idx, beach in enumerate(waves_data):
+            for hour_record in beach['hours']:
+                hour_record['beach'] = beach['beach']
                 for key in hour_record:
-                    print(key)
+                    if key == "time" or key == "beach":
+                        continue
                     prop_value = 0
                     count = 0
                     for source in hour_record[key]:
@@ -81,31 +89,49 @@ def waves_etl():
                         count += 1
                     prop_value = prop_value / count
                     hour_record[key] = prop_value
-        return waves_data
+                hour_records.append(hour_record)
 
-    def load(waves_data):
+        res = pd.DataFrame.from_records(hour_records).rename(columns={"time": "waveTs"})
+        return res
+
+    def load(waves_df: pd.DataFrame, db_conn_str: str):
         """
 
         TODO: DOCS
 
 
         """
+        engine = create_engine(db_conn_str, echo=False)
+        conn = engine.connect()
+        _ = waves_df.to_sql("waves", conn, if_exists="append", index=False)
 
-    beach_coords: dict[str, Coords] = {
-        "sombrio": {
+        return 1
+
+    
+    load_dotenv()
+    db_conn_str = os.environ.get("DB_CONN")
+    api_key = os.environ.get("STORMGLASS_API_KEY")
+    if not db_conn_str or not api_key:
+        return -1
+
+    beach_coords: list[Coords] = [{
+            "beach": "sombrio",
             "lat": 48.50033,
             "lng": -124.30093,
-        },
-        "jordan_river": {
-            "lat": 0,
-            "lng": 0,
-        }
-    }
+        }, {
+            "beach": "jordan river",
+            "lat": 48.50033,
+            "lng": -124.30093,
+    }]
 
-    sombrio_data = extract(beach_coords["sombrio"])
-    jordan_river_data= extract(beach_coords["jordan_river"])
+    beach_wave_data = []
+    for coords in beach_coords:
+        wave_data = extract(coords, api_key)
+        beach_wave_data.extend(wave_data)
 
-    waves_data = transform([sombrio_data, jordan_river_data])
-    load(waves_data)
+    waves_data = transform(beach_wave_data)
+
+    load(waves_data, db_conn_str)
+
 
 waves_etl()
