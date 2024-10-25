@@ -1,13 +1,11 @@
 import json
+from airflow.models.variable import Variable
 import pandas as pd
 from typing import TypedDict
 import arrow
 import requests as r
-from dotenv import load_dotenv
-import os
 from sqlalchemy import create_engine, Table, MetaData
 from sqlalchemy.dialects.postgresql import insert
-from dotenv import load_dotenv
 from airflow.decorators import dag, task
 from datetime import datetime
 
@@ -18,11 +16,15 @@ Coords = TypedDict("Coords", {"beach": str, "lat": float, "lng": float })
     schedule="@daily",
     tags=["waves"],
     catchup=False,
-    start_date=datetime.now()
+    start_date=datetime.now(),
+    default_args={
+        "email": ["mking@coolaid.org"]
+    }
 )
 def waves_etl():
     @task()
-    def extract(api_key: str):
+    def extract():
+
         """
         Fetches data from Storglass.io 
 
@@ -35,17 +37,17 @@ def waves_etl():
         }]
         """
 
+        api_key = Variable.get("STORMGLASS_API_KEY")
+        db_conn_uri = Variable.get("DB_CONN_URI")
+        if not api_key or not db_conn_uri:
+            return 1
+
         beach_coords: list[Coords] = [{
                 "beach": "sombrio",
                 "lat": 48.50033,
                 "lng": -124.30093,
         }]
-        #     }, {
-        #         "beach": "jordan river",
-        #         "lat": 48.50033,
-        #         "lng": -124.30093,
-        # }]
-        responses = []
+        waves_data = []
         start = arrow.now().floor('day')
         end = arrow.now().ceil('day')
         for coords in beach_coords:
@@ -79,20 +81,15 @@ def waves_etl():
                     'Authorization': api_key
                 }
             )
-            waves_data = response.json()
-            waves_data['beach'] = coords['beach']
+            record = response.json()
+            record['beach'] = coords['beach']
 
-            if "errors" not in waves_data:
-                responses.append(waves_data)
+            if "errors" not in record:
+                waves_data.append(record)
 
         with open("waves.json", "w") as outfile:
-            outfile.write(json.dumps(responses, indent=4))
-            
+            outfile.write(json.dumps(waves_data, indent=4))
 
-        return responses
-
-    @task()
-    def transform(waves_data: list):
         hour_records = []
         for idx, beach in enumerate(waves_data):
             if 'errors' in beach:
@@ -112,37 +109,19 @@ def waves_etl():
                 hour_records.append(hour_record)
 
         res = pd.DataFrame.from_records(hour_records).rename(columns={"time": "waveTs"})
-        res = res.to_dict(orient='records')
-        return res
+        waves_rows = res.to_dict(orient='records')
 
-    @task()
-    def load(waves_rows: list[dict], db_conn_str: str):
-        """
-
-        TODO: DOCS
-
-
-        """
         metadata = MetaData()
-        engine = create_engine(db_conn_str, echo=False)
+        engine = create_engine(db_conn_uri, echo=False)
         waves_table = Table("waves", metadata, autoload_with=engine)
         with engine.connect() as conn:
-            result = conn.execute(
+            conn.execute(
                 insert(waves_table),
                 waves_rows
             )
-        return 1
-    
+        return 0
 
-    load_dotenv()
-    db_conn_str = os.environ.get("DB_CONN")
-    api_key = os.environ.get("STORMGLASS_API_KEY")
-    if not db_conn_str or not api_key:
-        return -1
-
-    responses = extract(api_key)
-    waves_data = transform(responses)
-    load(waves_data, db_conn_str)
+    _ = extract()
 
 
 waves_etl()
